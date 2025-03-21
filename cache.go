@@ -1,4 +1,4 @@
-// Package plugin_simplecache is a plugin to cache responses to disk.
+// Package plugin_simplecache is a plugin to cache responses using Memcached.
 package plugin_simplecache
 
 import (
@@ -8,25 +8,25 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os" // добавлен импорт для логирования
+	"os"
 	"time"
 
+	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/pquerna/cachecontrol"
 )
 
 // Config configures the middleware.
 type Config struct {
-	Path            string `json:"path" yaml:"path" toml:"path"`
+	MemcacheAddress string `json:"memcacheAddress" yaml:"memcacheAddress" toml:"memcacheAddress"`
 	MaxExpiry       int    `json:"maxExpiry" yaml:"maxExpiry" toml:"maxExpiry"`
-	Cleanup         int    `json:"cleanup" yaml:"cleanup" toml:"cleanup"`
 	AddStatusHeader bool   `json:"addStatusHeader" yaml:"addStatusHeader" toml:"addStatusHeader"`
 }
 
 // CreateConfig returns a config instance.
 func CreateConfig() *Config {
 	return &Config{
+		MemcacheAddress: "localhost:11211",
 		MaxExpiry:       int((5 * time.Minute).Seconds()),
-		Cleanup:         int((5 * time.Minute).Seconds()),
 		AddStatusHeader: true,
 	}
 }
@@ -36,14 +36,13 @@ const (
 	cacheHitStatus   = "hit"
 	cacheMissStatus  = "miss"
 	cacheErrorStatus = "error"
-	cleanupDisabled  = -1
 )
 
 type cache struct {
-	name  string
-	cache *fileCache
-	cfg   *Config
-	next  http.Handler
+	name string
+	mc   *memcache.Client
+	cfg  *Config
+	next http.Handler
 }
 
 // New returns a plugin instance.
@@ -52,20 +51,16 @@ func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.H
 		return nil, errors.New("maxExpiry must be greater or equal to 1")
 	}
 
-	if cfg.Cleanup <= 1 && cfg.Cleanup != cleanupDisabled {
-		return nil, fmt.Errorf("cleanup must be greater or equal to 1 or disabled %d", cleanupDisabled)
-	}
-
-	fc, err := newFileCache(cfg.Path, time.Duration(cfg.Cleanup)*time.Second)
-	if err != nil {
-		return nil, err
+	mc := memcache.New(cfg.MemcacheAddress)
+	if mc == nil {
+		return nil, errors.New("failed to create memcache client")
 	}
 
 	m := &cache{
-		name:  name,
-		cache: fc,
-		cfg:   cfg,
-		next:  next,
+		name: name,
+		mc:   mc,
+		cfg:  cfg,
+		next: next,
 	}
 
 	return m, nil
@@ -79,18 +74,16 @@ type cacheData struct {
 
 // ServeHTTP serves an HTTP request.
 func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Вывод сообщения в терминал для каждого запроса
+	// Log incoming request
 	os.Stdout.WriteString("ПАЛУНДРА, ПРИШЕЛ ЗАПРОС!!\n")
 
 	cs := cacheMissStatus
-
 	key := cacheKey(r)
 
-	b, err := m.cache.Get(key)
+	item, err := m.mc.Get(key)
 	if err == nil {
 		var data cacheData
-
-		err := json.Unmarshal(b, &data)
+		err := json.Unmarshal(item.Value, &data)
 		if err != nil {
 			cs = cacheErrorStatus
 		} else {
@@ -126,12 +119,14 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Body:    rw.body,
 	}
 
-	b, err = json.Marshal(data)
+	b, err := json.Marshal(data)
 	if err != nil {
 		log.Printf("Error serializing cache item: %v", err)
+		return
 	}
 
-	if err = m.cache.Set(key, b, expiry); err != nil {
+	err = m.mc.Set(&memcache.Item{Key: key, Value: b, Expiration: int32(expiry.Seconds())})
+	if err != nil {
 		log.Printf("Error setting cache item: %v", err)
 	}
 }
