@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os" // добавлен импорт для логирования
 	"time"
 
 	"github.com/pquerna/cachecontrol"
@@ -78,6 +79,9 @@ type cacheData struct {
 
 // ServeHTTP serves an HTTP request.
 func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Вывод сообщения в терминал для каждого запроса
+	os.Stdout.WriteString("ПАЛУНДРА, ПРИШЕЛ ЗАПРОС!!\n")
+
 	cs := cacheMissStatus
 
 	key := cacheKey(r)
