@@ -1,4 +1,4 @@
-// Package plugin_simplecache is a plugin to cache responses using go-cache.
+// Package plugin_simplecache is a plugin to cache responses to disk.
 package plugin_simplecache
 
 import (
@@ -8,23 +8,25 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
+	"os" // добавлен импорт для логирования
 	"time"
 
-	"github.com/patrickmn/go-cache"
 	"github.com/pquerna/cachecontrol"
 )
 
 // Config configures the middleware.
 type Config struct {
-	MaxExpiry       int  `json:"maxExpiry" yaml:"maxExpiry" toml:"maxExpiry"`
-	AddStatusHeader bool `json:"addStatusHeader" yaml:"addStatusHeader" toml:"addStatusHeader"`
+	Path            string `json:"path" yaml:"path" toml:"path"`
+	MaxExpiry       int    `json:"maxExpiry" yaml:"maxExpiry" toml:"maxExpiry"`
+	Cleanup         int    `json:"cleanup" yaml:"cleanup" toml:"cleanup"`
+	AddStatusHeader bool   `json:"addStatusHeader" yaml:"addStatusHeader" toml:"addStatusHeader"`
 }
 
 // CreateConfig returns a config instance.
 func CreateConfig() *Config {
 	return &Config{
 		MaxExpiry:       int((5 * time.Minute).Seconds()),
+		Cleanup:         int((5 * time.Minute).Seconds()),
 		AddStatusHeader: true,
 	}
 }
@@ -34,11 +36,12 @@ const (
 	cacheHitStatus   = "hit"
 	cacheMissStatus  = "miss"
 	cacheErrorStatus = "error"
+	cleanupDisabled  = -1
 )
 
 type cache struct {
 	name  string
-	store *cache.Cache
+	cache *fileCache
 	cfg   *Config
 	next  http.Handler
 }
@@ -49,11 +52,18 @@ func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.H
 		return nil, errors.New("maxExpiry must be greater or equal to 1")
 	}
 
-	c := cache.New(time.Duration(cfg.MaxExpiry)*time.Second, 10*time.Minute)
+	if cfg.Cleanup <= 1 && cfg.Cleanup != cleanupDisabled {
+		return nil, fmt.Errorf("cleanup must be greater or equal to 1 or disabled %d", cleanupDisabled)
+	}
+
+	fc, err := newFileCache(cfg.Path, time.Duration(cfg.Cleanup)*time.Second)
+	if err != nil {
+		return nil, err
+	}
 
 	m := &cache{
 		name:  name,
-		store: c,
+		cache: fc,
 		cfg:   cfg,
 		next:  next,
 	}
@@ -69,16 +79,22 @@ type cacheData struct {
 
 // ServeHTTP serves an HTTP request.
 func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Log incoming request
+	// Вывод сообщения в терминал для каждого запроса
 	os.Stdout.WriteString("ПАЛУНДРА, ПРИШЕЛ ЗАПРОС!!\n")
 
 	cs := cacheMissStatus
+
 	key := cacheKey(r)
 
-	if data, found := m.store.Get(key); found {
-		var cachedData cacheData
-		if err := json.Unmarshal(data.([]byte), &cachedData); err == nil {
-			for key, vals := range cachedData.Headers {
+	b, err := m.cache.Get(key)
+	if err == nil {
+		var data cacheData
+
+		err := json.Unmarshal(b, &data)
+		if err != nil {
+			cs = cacheErrorStatus
+		} else {
+			for key, vals := range data.Headers {
 				for _, val := range vals {
 					w.Header().Add(key, val)
 				}
@@ -86,11 +102,9 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if m.cfg.AddStatusHeader {
 				w.Header().Set(cacheHeader, cacheHitStatus)
 			}
-			w.WriteHeader(cachedData.Status)
-			_, _ = w.Write(cachedData.Body)
+			w.WriteHeader(data.Status)
+			_, _ = w.Write(data.Body)
 			return
-		} else {
-			cs = cacheErrorStatus
 		}
 	}
 
@@ -112,13 +126,14 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Body:    rw.body,
 	}
 
-	b, err := json.Marshal(data)
+	b, err = json.Marshal(data)
 	if err != nil {
 		log.Printf("Error serializing cache item: %v", err)
-		return
 	}
 
-	m.store.Set(key, b, expiry)
+	if err = m.cache.Set(key, b, expiry); err != nil {
+		log.Printf("Error setting cache item: %v", err)
+	}
 }
 
 func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (time.Duration, bool) {
