@@ -1,4 +1,4 @@
-// Package plugin_simplecache is a plugin to cache responses using Memcached.
+// Package plugin_simplecache is a plugin to cache responses using go-cache.
 package plugin_simplecache
 
 import (
@@ -11,21 +11,19 @@ import (
 	"os"
 	"time"
 
-	"github.com/bradfitz/gomemcache/memcache"
+	"github.com/patrickmn/go-cache"
 	"github.com/pquerna/cachecontrol"
 )
 
 // Config configures the middleware.
 type Config struct {
-	MemcacheAddress string `json:"memcacheAddress" yaml:"memcacheAddress" toml:"memcacheAddress"`
-	MaxExpiry       int    `json:"maxExpiry" yaml:"maxExpiry" toml:"maxExpiry"`
-	AddStatusHeader bool   `json:"addStatusHeader" yaml:"addStatusHeader" toml:"addStatusHeader"`
+	MaxExpiry       int  `json:"maxExpiry" yaml:"maxExpiry" toml:"maxExpiry"`
+	AddStatusHeader bool `json:"addStatusHeader" yaml:"addStatusHeader" toml:"addStatusHeader"`
 }
 
 // CreateConfig returns a config instance.
 func CreateConfig() *Config {
 	return &Config{
-		MemcacheAddress: "localhost:11211",
 		MaxExpiry:       int((5 * time.Minute).Seconds()),
 		AddStatusHeader: true,
 	}
@@ -39,10 +37,10 @@ const (
 )
 
 type cache struct {
-	name string
-	mc   *memcache.Client
-	cfg  *Config
-	next http.Handler
+	name  string
+	store *cache.Cache
+	cfg   *Config
+	next  http.Handler
 }
 
 // New returns a plugin instance.
@@ -51,16 +49,13 @@ func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.H
 		return nil, errors.New("maxExpiry must be greater or equal to 1")
 	}
 
-	mc := memcache.New(cfg.MemcacheAddress)
-	if mc == nil {
-		return nil, errors.New("failed to create memcache client")
-	}
+	c := cache.New(time.Duration(cfg.MaxExpiry)*time.Second, 10*time.Minute)
 
 	m := &cache{
-		name: name,
-		mc:   mc,
-		cfg:  cfg,
-		next: next,
+		name:  name,
+		store: c,
+		cfg:   cfg,
+		next:  next,
 	}
 
 	return m, nil
@@ -80,14 +75,10 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cs := cacheMissStatus
 	key := cacheKey(r)
 
-	item, err := m.mc.Get(key)
-	if err == nil {
-		var data cacheData
-		err := json.Unmarshal(item.Value, &data)
-		if err != nil {
-			cs = cacheErrorStatus
-		} else {
-			for key, vals := range data.Headers {
+	if data, found := m.store.Get(key); found {
+		var cachedData cacheData
+		if err := json.Unmarshal(data.([]byte), &cachedData); err == nil {
+			for key, vals := range cachedData.Headers {
 				for _, val := range vals {
 					w.Header().Add(key, val)
 				}
@@ -95,9 +86,11 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if m.cfg.AddStatusHeader {
 				w.Header().Set(cacheHeader, cacheHitStatus)
 			}
-			w.WriteHeader(data.Status)
-			_, _ = w.Write(data.Body)
+			w.WriteHeader(cachedData.Status)
+			_, _ = w.Write(cachedData.Body)
 			return
+		} else {
+			cs = cacheErrorStatus
 		}
 	}
 
@@ -125,10 +118,7 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = m.mc.Set(&memcache.Item{Key: key, Value: b, Expiration: int32(expiry.Seconds())})
-	if err != nil {
-		log.Printf("Error setting cache item: %v", err)
-	}
+	m.store.Set(key, b, expiry)
 }
 
 func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (time.Duration, bool) {
