@@ -1,6 +1,3 @@
-# github.com/patrickmn/go-cache v2.1.0+incompatible
-## explicit
-github.com/patrickmn/go-cache
 # github.com/pquerna/cachecontrol v0.0.0-20180517163645-1555304b9b35
 ## explicit
 github.com/pquerna/cachecontrol

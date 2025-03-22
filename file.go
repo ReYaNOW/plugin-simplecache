@@ -1,4 +1,3 @@
-// Package plugin_simplecache is a plugin to cache responses to disk.
 package plugin_simplecache
 
 import (
@@ -34,10 +33,10 @@ func newFileCache(path string, vacuum time.Duration) (*fileCache, error) {
 
 	fc := &fileCache{
 		path: path,
-		pm:   &pathMutex{lock: map[string]*fileLock{}},
+		pm:   &pathMutex{lock: make(map[string]*fileLock)},
 	}
 
-	if vacuum > 0 * time.Second {
+	if vacuum > 0 {
 		go fc.vacuum(vacuum)
 	}
 
@@ -50,10 +49,7 @@ func (c *fileCache) vacuum(interval time.Duration) {
 
 	for range timer.C {
 		_ = filepath.Walk(c.path, func(path string, info os.FileInfo, err error) error {
-			switch {
-			case err != nil:
-				return err
-			case info.IsDir():
+			if err != nil || info.IsDir() {
 				return nil
 			}
 
@@ -61,25 +57,22 @@ func (c *fileCache) vacuum(interval time.Duration) {
 			mu.Lock()
 			defer mu.Unlock()
 
-			// Get the expiry.
-			var t [8]byte
 			f, err := os.Open(filepath.Clean(path))
 			if err != nil {
-				// Just skip the file in this case.
-				return nil // nolint:nilerr // skip
+				return nil
 			}
-			if n, err := f.Read(t[:]); err != nil && n != 8 {
+
+			var t [8]byte
+			if _, err := f.Read(t[:]); err != nil {
+				_ = f.Close()
 				return nil
 			}
 			_ = f.Close()
 
 			expires := time.Unix(int64(binary.LittleEndian.Uint64(t[:])), 0)
-			if !expires.Before(time.Now()) {
-				return nil
+			if expires.Before(time.Now()) {
+				_ = os.Remove(path)
 			}
-
-			// Delete the file.
-			_ = os.Remove(path)
 			return nil
 		})
 	}
@@ -91,13 +84,13 @@ func (c *fileCache) Get(key string) ([]byte, error) {
 	defer mu.RUnlock()
 
 	p := keyPath(c.path, key)
-	if info, err := os.Stat(p); err != nil || info.IsDir() {
+	b, err := ioutil.ReadFile(filepath.Clean(p))
+	if err != nil {
 		return nil, errCacheMiss
 	}
 
-	b, err := ioutil.ReadFile(filepath.Clean(p))
-	if err != nil {
-		return nil, fmt.Errorf("error reading file %q: %w", p, err)
+	if len(b) < 8 {
+		return nil, errCacheMiss
 	}
 
 	expires := time.Unix(int64(binary.LittleEndian.Uint64(b[:8])), 0)
@@ -116,49 +109,26 @@ func (c *fileCache) Set(key string, val []byte, expiry time.Duration) error {
 
 	p := keyPath(c.path, key)
 	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
-		return fmt.Errorf("error creating file path: %w", err)
+		return fmt.Errorf("error creating path: %w", err)
 	}
-
-	f, err := os.OpenFile(filepath.Clean(p), os.O_RDWR|os.O_CREATE, 0600)
-	if err != nil {
-		return fmt.Errorf("error creating file: %w", err)
-	}
-
-	defer func() {
-		_ = f.Close()
-	}()
 
 	timestamp := uint64(time.Now().Add(expiry).Unix())
-
 	var t [8]byte
-
 	binary.LittleEndian.PutUint64(t[:], timestamp)
 
-	if _, err = f.Write(t[:]); err != nil {
-		return fmt.Errorf("error writing file: %w", err)
-	}
-
-	if _, err = f.Write(val); err != nil {
-		return fmt.Errorf("error writing file: %w", err)
-	}
-
-	return nil
+	return os.WriteFile(p, append(t[:], val...), 0600)
 }
 
 func keyHash(key string) [4]byte {
 	h := crc32.Checksum([]byte(key), crc32.IEEETable)
-
 	var b [4]byte
-
 	binary.LittleEndian.PutUint32(b[:], h)
-
 	return b
 }
 
 func keyPath(path, key string) string {
 	h := keyHash(key)
 	key = strings.NewReplacer("/", "-", ":", "_").Replace(key)
-
 	return filepath.Join(
 		path,
 		hex.EncodeToString(h[0:1]),
@@ -187,38 +157,28 @@ func (m *pathMutex) MutexAt(path string) *fileLock {
 	fl.cleanup = func() {
 		m.mu.Lock()
 		defer m.mu.Unlock()
-
 		fl.ref--
 		if fl.ref == 0 {
 			delete(m.lock, path)
 		}
 	}
 	m.lock[path] = fl
-
 	return fl
 }
 
 type fileLock struct {
-	ref     int
-	cleanup func()
-
-	mu sync.RWMutex
+	mu       sync.RWMutex
+	ref      int
+	cleanup  func()
 }
 
-func (l *fileLock) RLock() {
-	l.mu.RLock()
-}
-
-func (l *fileLock) RUnlock() {
+func (l *fileLock) RLock()   { l.mu.RLock() }
+func (l *fileLock) RUnlock() { 
 	l.mu.RUnlock()
 	l.cleanup()
 }
-
-func (l *fileLock) Lock() {
-	l.mu.Lock()
-}
-
-func (l *fileLock) Unlock() {
+func (l *fileLock) Lock()   { l.mu.Lock() }
+func (l *fileLock) Unlock() { 
 	l.mu.Unlock()
 	l.cleanup()
 }

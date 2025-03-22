@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/pquerna/cachecontrol"
@@ -74,19 +73,16 @@ func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.H
 
 type cacheData struct {
 	Status  int
-	Headers map[string][]string
+	Headers http.Header
 	Body    []byte
 }
 
 // ServeHTTP serves an HTTP request.
 func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Вывод сообщения в терминал для каждого запроса
 	os.Stdout.WriteString("ПАЛУНДРА, ПРИШЕЛ ЗАПРОС!!\n")
 
 	cs := cacheMissStatus
-
 	key := cacheKey(r)
-	log.Printf("Cache key: %s", key)
 
 	b, err := m.cache.Get(key)
 	if err == nil {
@@ -107,11 +103,8 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			w.WriteHeader(data.Status)
 			_, _ = w.Write(data.Body)
-			log.Printf("Cache hit for key: %s", key)
 			return
 		}
-	} else {
-		log.Printf("Cache miss for key: %s, error: %v", key, err)
 	}
 
 	if m.cfg.AddStatusHeader {
@@ -123,17 +116,15 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	expiry, ok := m.cacheable(r, w, rw.status)
 	if !ok {
-		log.Printf("Response not cacheable for key: %s", key)
 		return
 	}
 
 	data := cacheData{
 		Status:  rw.status,
-		Headers: w.Header().Clone(), // Клонируем заголовки, чтобы избежать изменений
+		Headers: w.Header().Clone(),
 		Body:    rw.body,
 	}
 
-	// Удаляем заголовки, которые не должны влиять на кэш
 	data.Headers.Del("Date")
 	data.Headers.Del("Set-Cookie")
 	data.Headers.Del("Cache-Status")
@@ -141,23 +132,18 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b, err = json.Marshal(data)
 	if err != nil {
 		log.Printf("Error serializing cache item: %v", err)
-		return
 	}
 
 	if err = m.cache.Set(key, b, expiry); err != nil {
 		log.Printf("Error setting cache item: %v", err)
-	} else {
-		log.Printf("Cache set for key: %s with expiry: %v", key, expiry)
 	}
 }
 
 func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (time.Duration, bool) {
-	// Принудительно кэшируем успешные ответы
 	if status == http.StatusOK {
 		return time.Duration(m.cfg.MaxExpiry) * time.Second, true
 	}
 
-	// Остальная логика
 	reasons, expireBy, err := cachecontrol.CachableResponseWriter(r, status, w, cachecontrol.Options{})
 	if err != nil || len(reasons) > 0 {
 		return 0, false
@@ -174,11 +160,8 @@ func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (t
 }
 
 func cacheKey(r *http.Request) string {
-	// Включаем метод, хост, путь и query parameters в ключ
-	key := r.Method + r.Host + r.URL.Path + "?" + r.URL.RawQuery
-	// Включаем заголовок Authorization в ключ
-	key += "|Authorization:" + r.Header.Get("Authorization")
-	return key
+	return r.Method + r.Host + r.URL.Path + "?" + r.URL.RawQuery +
+		"|Authorization:" + r.Header.Get("Authorization")
 }
 
 type responseWriter struct {
@@ -199,31 +182,4 @@ func (rw *responseWriter) Write(p []byte) (int, error) {
 func (rw *responseWriter) WriteHeader(s int) {
 	rw.status = s
 	rw.ResponseWriter.WriteHeader(s)
-}
-
-// fileCache реализация
-type fileCache struct {
-	path    string
-	cleanup time.Duration
-}
-
-func newFileCache(path string, cleanup time.Duration) (*fileCache, error) {
-	if err := os.MkdirAll(path, 0755); err != nil {
-		return nil, err
-	}
-	return &fileCache{path: path, cleanup: cleanup}, nil
-}
-
-func (fc *fileCache) Get(key string) ([]byte, error) {
-	filePath := filepath.Join(fc.path, key)
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, err
-	}
-	return data, nil
-}
-
-func (fc *fileCache) Set(key string, data []byte, expiry time.Duration) error {
-	filePath := filepath.Join(fc.path, key)
-	return os.WriteFile(filePath, data, 0644)
 }
